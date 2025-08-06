@@ -1,0 +1,12 @@
+fastapi==0.110.0
+uvicorn
+pydantic==2.5.3
+requests
+PyMuPDF
+pytesseract
+faiss-cpu
+sentence-transformers
+google-generativeai
+python-dotenv
+langchain==0.0.350
+langchain-core==0.1.1
