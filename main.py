@@ -119,8 +119,8 @@ async def process_document(request: Request, payload: RequestPayload):
         f"Questions: {json.dumps(payload.questions)}"
     )
     
-    # Define request timeout
-    REQUEST_TIMEOUT = 90
+    # Define request timeout - Extended from 90 to 120 seconds
+    REQUEST_TIMEOUT = 120
     
     try:
         # Call the RAG pipeline using threadpool with timeout to avoid blocking the event loop
@@ -137,7 +137,7 @@ async def process_document(request: Request, payload: RequestPayload):
     except TimeoutError:
         return JSONResponse(
             status_code=504,
-            content={"detail": "Request processing timed out after 90 seconds."}
+            content={"detail": "Request processing timed out after 120 seconds."}
         )
     
     # Check if the result contains an error

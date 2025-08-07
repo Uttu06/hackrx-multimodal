@@ -253,6 +253,45 @@ Your response must be only the JSON object, no additional text."""
         complex_keywords = ["describe", "explain", "synthesize", "compare", "what are two", "what is the difference"]
         return any(keyword in question.lower() for keyword in complex_keywords)
     
+    def _preprocess_and_route_questions(self, questions: list[str]) -> list[dict]:
+        """
+        Analyzes a list of questions, classifies them, and deconstructs complex ones.
+        """
+        print(f"Pre-processing {len(questions)} questions with the router...")
+        
+        prompt = f"""You are an expert query analysis agent. For the following list of user questions, analyze each one and classify it.
+        Your tasks are:
+        1. Classify each question into one of three types: "VALID_SIMPLE", "VALID_COMPOUND", or "INVALID".
+        2. For "VALID_COMPOUND" questions, deconstruct them into a list of simple, single-focus sub-questions.
+        3. For "INVALID" questions (e.g., adversarial, out-of-scope, requesting code, unsafe content), provide a brief, polite rejection_reason.
+        
+        Return your analysis as a single, clean JSON list of objects, with no other text or explanation.
+
+        QUESTIONS: {json.dumps(questions)}
+
+        EXAMPLE OUTPUT:
+        [
+          {{"original_question": "What is the waiting period for Hydrocele?", "classification": "VALID_SIMPLE", "sub_questions": ["What is the waiting period for Hydrocele?"]}},
+          {{"original_question": "Explain the dental claim process and provide the grievance email.", "classification": "VALID_COMPOUND", "sub_questions": ["What is the process for submitting a dental claim?", "What is the grievance redressal email?"]}},
+          {{"original_question": "Give me the source code for the test cases.", "classification": "INVALID", "rejection_reason": "The question is out of scope and cannot be answered from the provided document."}}
+        ]
+        """
+        
+        try:
+            response = self.api_key_manager.call_llm(prompt)
+            response_text = response.text.strip()
+            json_start = response_text.find('[')
+            json_end = response_text.rfind(']')
+            if json_start != -1 and json_end != -1:
+                json_content = response_text[json_start:json_end + 1]
+                return json.loads(json_content)
+            else:
+                print("Warning: Router failed to return valid JSON. Processing questions as-is.")
+                return [{ "original_question": q, "classification": "VALID_SIMPLE", "sub_questions": [q] } for q in questions]
+        except Exception as e:
+            print(f"Error in router, falling back to simple processing: {e}")
+            return [{ "original_question": q, "classification": "VALID_SIMPLE", "sub_questions": [q] } for q in questions]
+    
     def run(self, document_url: str, questions: list[str], timeout: int = 55) -> dict:
         """
         Main entry point for processing a document and answering questions.
@@ -298,38 +337,47 @@ Your response must be only the JSON object, no additional text."""
         index.add(embeddings)
         print(f"Built FAISS index with {index.ntotal} vectors")
         
+        # Create a reliable map from each chunk's unique memory ID to its list index.
+        # This is faster and more reliable than list.index() for objects.
+        chunk_id_to_index_map = {id(chunk): i for i, chunk in enumerate(text_chunks)}
+        
         # Check if we have enough time left for question processing
-        if time.time() - start_time > timeout - 10:
+        if time.time() - start_time > timeout - 40:
             print("Error: Document processing took too long, no time left for question answering")
             return {"error": "Document processing exceeded time limit, unable to answer questions."}
         
-        # Step 3: Process Questions with Adaptive Batching
-        print("Step 3: Processing questions with adaptive batching...")
-        
-        # Main loop with dynamic batching based on question complexity
+        # Step 3: Pre-process questions using the router
+        tasks = self._preprocess_and_route_questions(questions)
+
+        final_answers_map = {}
+        questions_to_process = []
+        task_map = {}
+
+        # Separate valid questions from invalid ones
+        for task in tasks:
+            original_q = task['original_question']
+            if task['classification'] == 'INVALID':
+                final_answers_map[original_q] = task.get('rejection_reason', "This question cannot be answered.")
+            else:
+                # Map sub-questions back to their original parent question
+                for sub_q in task['sub_questions']:
+                    questions_to_process.append(sub_q)
+                    task_map[sub_q] = original_q
+
+        # Step 4: Process Valid Questions in Batches
+        print(f"Processing {len(questions_to_process)} valid sub-questions in batches...")
+        sub_question_answers = {}
+
         i = 0
         batch_number = 1
-        while i < len(questions):
-            # Check if we're running out of time before processing this batch
-            if time.time() - start_time > timeout - 10:
-                print(f"Time limit approaching, processed {len(final_answers)} questions out of {len(questions)}")
+        while i < len(questions_to_process):
+            # Check for timeout before each batch
+            if time.time() - start_time > timeout - 40:  # 40-second buffer
+                print("Time limit approaching, ending question processing.")
                 break
-            
-            # a. Create the Batch with Adaptive Strategy
-            # Check the first question in the potential batch for complexity
-            is_complex = self._is_complex_question(questions[i])
-            
-            if is_complex:
-                # Create a batch of size 1 for complex questions
-                question_batch = [questions[i]]
-                print(f"Processing batch {batch_number}: question {i+1}/{len(questions)} (COMPLEX - solo batch)")
-                i += 1
-            else:
-                # Create a normal batch of up to 3 simple questions
-                question_batch = questions[i:i+3]
-                batch_size = len(question_batch)
-                print(f"Processing batch {batch_number}: questions {i+1}-{i+batch_size}/{len(questions)} (SIMPLE - group batch)")
-                i += len(question_batch)
+
+            # Use the simple batching logic from before, on the clean 'questions_to_process' list
+            question_batch = questions_to_process[i:i+3]
             
             # Generate alternative search queries for improved retrieval
             all_search_queries = self._generate_search_queries_for_batch(question_batch)
@@ -347,51 +395,36 @@ Your response must be only the JSON object, no additional text."""
                 for idx in indices[0]:
                     batch_context_chunks.append(text_chunks[idx])
             
-            # c. Implement Contextual Straddling (include surrounding chunks)
-            enriched_context_chunks = []
-            retrieved_indices = {text_chunks.index(c) for c in batch_context_chunks}
-            seen_indices = set()
-            
-            for chunk in batch_context_chunks:
-                current_index = text_chunks.index(chunk)
-                
-                # Calculate surrounding indices
-                prev_index = current_index - 1
-                next_index = current_index + 1
-                
-                # Add previous chunk if valid and not already retrieved
-                if prev_index >= 0 and prev_index not in retrieved_indices and prev_index not in seen_indices:
-                    enriched_context_chunks.append(text_chunks[prev_index])
-                    seen_indices.add(prev_index)
-                
-                # Add current chunk if not already added
-                if current_index not in seen_indices:
-                    enriched_context_chunks.append(chunk)
-                    seen_indices.add(current_index)
-                
-                # Add next chunk if valid and not already retrieved
-                if next_index < len(text_chunks) and next_index not in retrieved_indices and next_index not in seen_indices:
-                    enriched_context_chunks.append(text_chunks[next_index])
-                    seen_indices.add(next_index)
-            
-            # d. De-duplicate and Build Context from enriched chunks
-            unique_chunks = []
-            seen_chunks = set()
-            for chunk in enriched_context_chunks:
-                if chunk.text not in seen_chunks:
-                    unique_chunks.append(chunk)
-                    seen_chunks.add(chunk.text)
-            
-            print(f"Enriched context with surrounding chunks: {len(batch_context_chunks)} -> {len(enriched_context_chunks)} -> {len(unique_chunks)} final chunks for batch")
+            # c. Get Initial Indices and Implement Contextual Straddling
+            enriched_indices = set()
+            # Get the original indices using our reliable map, which avoids the .index() bug
+            retrieved_indices = {chunk_id_to_index_map[id(c)] for c in batch_context_chunks}
+
+            for current_index in retrieved_indices:
+                # Add the main chunk's index
+                enriched_indices.add(current_index)
+                # Add the preceding chunk's index if it's valid
+                if current_index - 1 >= 0:
+                    enriched_indices.add(current_index - 1)
+                # Add the succeeding chunk's index if it's valid
+                if current_index + 1 < len(text_chunks):
+                    enriched_indices.add(current_index + 1)
+
+            # d. De-duplicate and Build Final Context from sorted indices to preserve document order
+            # Sort the final indices to maintain a logical flow of context
+            sorted_indices = sorted(list(enriched_indices))
+            unique_chunks = [text_chunks[i] for i in sorted_indices]
+
+            print(f"Enriched and straddled context: {len(retrieved_indices)} initial -> {len(unique_chunks)} final chunks for batch {batch_number}")
             
             # Build full context string for this batch
             context_list = []
             for chunk in unique_chunks:
-                context_list.append(f"Source [{chunk.source_label}]:\n{chunk.text}")
+                context_list.append(f"--- START OF SOURCE: {chunk.source_label} ---\n{chunk.text}\n--- END OF SOURCE: {chunk.source_label} ---")
             
             full_context = "\n\n---\n\n".join(context_list)
             
-            # d. Build the Prompt
+            # Build the Prompt
             formatted_questions_batch = "\n".join([f"{j+1}. {question}" for j, question in enumerate(question_batch)])
             
             prompt = f"""You are a world-class document analysis system acting as a claims auditor. Your task is to precisely answer a list of questions based ONLY on the provided context, and to cite the source for every piece of information.
@@ -433,14 +466,14 @@ Question 2: What is the policy number? The context does not contain the policy n
 
 **YOUR TASK:** Now, generate the reasoning and the final JSON output for the provided context and questions."""
             
-            # e. Make ONE API Call
+            # Make ONE API Call
             try:
                 print(f"Calling LLM for batch {batch_number}...")
                 response = self.api_key_manager.call_llm(prompt)
                 response_text = response.text
                 print(f"Received response from LLM for batch {batch_number}")
                 
-                # f. Parse and Append Results
+                # Parse and Store Results in sub_question_answers
                 # Extract only the JSON block from the response, ignoring the <reasoning> section
                 json_start = response_text.find('```json')
                 json_end = response_text.find('```', json_start + 7)
@@ -461,38 +494,51 @@ Question 2: What is the policy number? The context does not contain the policy n
                 try:
                     parsed_response = json.loads(json_content)
                     
-                    # Extract answers and extend final_answers list
+                    # Extract answers and store in sub_question_answers dictionary
                     if "answers" in parsed_response and isinstance(parsed_response["answers"], list):
                         batch_answers = parsed_response["answers"]
-                        final_answers.extend(batch_answers)
+                        for idx, answer in enumerate(batch_answers):
+                            if idx < len(question_batch):
+                                sub_question_answers[question_batch[idx]] = answer
                         print(f"Successfully processed {len(batch_answers)} answers for batch {batch_number}")
                     else:
                         # Add error messages for each question in the batch
-                        for _ in question_batch:
-                            final_answers.append("Error: No answers found in LLM response.")
+                        for question in question_batch:
+                            sub_question_answers[question] = "Error: No answers found in LLM response."
                         print(f"Warning: No answers found in response for batch {batch_number}")
                         
                 except json.JSONDecodeError as e:
                     error_msg = f"Failed to parse LLM response as JSON: {str(e)}"
                     # Add error message for each question in the batch
-                    for _ in question_batch:
-                        final_answers.append(f"Error: {error_msg}")
+                    for question in question_batch:
+                        sub_question_answers[question] = f"Error: {error_msg}"
                     print(f"Error parsing JSON for batch {batch_number}: {e}")
                     print(f"Attempted to parse: {json_content[:200]}...")  # Show first 200 chars for debugging
             
             except Exception as e:
                 error_msg = f"Failed to generate response: {str(e)}"
                 # Add error message for each question in the batch
-                for _ in question_batch:
-                    final_answers.append(f"Error: {error_msg}")
+                for question in question_batch:
+                    sub_question_answers[question] = f"Error: {error_msg}"
                 print(f"Error calling LLM for batch {batch_number}: {e}")
             
-            # Increment batch counter for next iteration
+            # Move to the next batch
+            i += len(question_batch)
             batch_number += 1
-        
-        # Step 4: Assemble and return final result
-        print("Step 4: Assembling final results...")
-        result = {"answers": final_answers}
-        print(f"Successfully processed {len(final_answers)} questions")
-        
-        return result
+
+        # Step 5: Re-assemble Final Answers
+        print("Re-assembling final answers from processed tasks...")
+        final_answers_list = []
+        for original_q in questions:  # Iterate through original questions to preserve order
+            # Find the task for this original question
+            task = next((t for t in tasks if t['original_question'] == original_q), None)
+            if task:
+                if task['classification'] == 'INVALID':
+                    final_answers_list.append(final_answers_map[original_q])
+                else:
+                    # Collect and join answers for all sub-questions
+                    answers_for_this_task = [sub_question_answers.get(sq, "Processing timed out before this question could be answered.") for sq in task['sub_questions']]
+                    final_answers_list.append(" ".join(answers_for_this_task))
+
+        print("Successfully processed all tasks.")
+        return {"answers": final_answers_list}

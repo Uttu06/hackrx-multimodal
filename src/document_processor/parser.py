@@ -52,7 +52,8 @@ def parse_document(document_url: str, timeout: int = 300) -> list[Chunk]:
     """
     # Record start time for timeout tracking
     start_time = time.time()
-    processing_timeout = 50  # Hardcoded 50-second limit for parsing
+    # Proportional timeout: allocate 75 seconds for parsing within 120-second window, leaving 45-second buffer
+    processing_timeout = timeout - 45
     
     try:
         # Download the PDF document
