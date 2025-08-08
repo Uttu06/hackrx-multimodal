@@ -16,7 +16,7 @@ if not GEMINI_API_KEY_LIST and GEMINI_API_KEY:
     GEMINI_API_KEY_LIST = [GEMINI_API_KEY]
 
 # Model Configuration
-EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
+EMBEDDING_MODEL_NAME = 'BAAI/bge-m3'
 
 # Search Configuration
 TOP_K_RESULTS = 5

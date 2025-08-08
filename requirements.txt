@@ -10,3 +10,8 @@ google-generativeai
 python-dotenv
 langchain==0.0.350
 langchain-core==0.1.1
+python-docx
+python-pptx
+pandas
+openpyxl
+eml-parser

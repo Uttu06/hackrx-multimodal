@@ -6,15 +6,18 @@
 import asyncio
 import logging
 import json
+import os
 from asyncio.exceptions import TimeoutError
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.security import HTTPBearer
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from urllib.parse import urlparse
 
 # Import custom modules
 from src.rag_pipeline.core import RAGPipeline
 from src.utils.helpers import run_in_threadpool
+from src.document_processor.parser import UnsupportedDocumentError
 
 
 # Define Pydantic Models
@@ -40,6 +43,9 @@ class ResponsePayload(BaseModel):
     answers: list[str]
 
 
+# Define supported file extensions
+SUPPORTED_EXTENSIONS = {'.pdf', '.docx', '.xlsx', '.pptx', '.eml', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'}
+
 # Configure logging
 logging.basicConfig(
     filename="api_requests.log",
@@ -51,7 +57,7 @@ logging.basicConfig(
 # Instantiate FastAPI application
 app = FastAPI(
     title="Multimodal RAG API",
-    description="A Retrieval-Augmented Generation API for processing PDF documents and answering questions",
+    description="A Retrieval-Augmented Generation API for processing various document types and answering questions",
     version="1.0.0"
 )
 
@@ -80,6 +86,43 @@ def verify_token(credentials = Depends(security)):
         raise HTTPException(status_code=403, detail="Invalid or missing token")
 
 
+def check_file_extension(url: str) -> str:
+    """
+    Extract and validate file extension from URL before processing.
+    
+    Args:
+        url (str): The document URL
+        
+    Returns:
+        str: The file extension
+        
+    Raises:
+        UnsupportedDocumentError: If the file extension is not supported
+    """
+    try:
+        # Parse the URL and get the path
+        parsed_url = urlparse(url)
+        path = parsed_url.path
+        
+        # Remove query parameters if present
+        path = path.split('?')[0]
+        
+        # Extract file extension
+        file_extension = os.path.splitext(path)[-1].lower()
+        
+        # Check if extension is supported
+        if file_extension not in SUPPORTED_EXTENSIONS:
+            raise UnsupportedDocumentError(f"Unsupported file type: {file_extension}")
+            
+        return file_extension
+        
+    except Exception as e:
+        if isinstance(e, UnsupportedDocumentError):
+            raise e
+        # If we can't parse the extension, assume it's unsupported
+        raise UnsupportedDocumentError("Unable to determine file type from URL")
+
+
 @app.get("/")
 async def root():
     """
@@ -94,20 +137,21 @@ async def root():
 @app.post("/hackrx/run", response_model=ResponsePayload, dependencies=[Depends(verify_token)])
 async def process_document(request: Request, payload: RequestPayload):
     """
-    Process a PDF document and answer questions based on its content.
+    Process a document and answer questions based on its content.
     
     This endpoint handles the complete RAG pipeline:
-    1. Downloads and processes the PDF document
-    2. Generates embeddings and builds search index
-    3. Retrieves relevant context for each question
-    4. Uses Gemini LLM to generate answers
+    1. Validates file extension before download
+    2. Downloads and processes the document (PDF, DOCX, XLSX, PPTX, EML, Images)
+    3. Generates embeddings and builds search index
+    4. Retrieves relevant context for each question
+    5. Uses Gemini LLM to generate answers
     
     Args:
         payload (RequestPayload): Request containing document URL and questions
         
     Returns:
         ResponsePayload: Response containing answers to the questions
-        dict: Error response if processing fails
+        JSONResponse: Error response if processing fails
     """
     print(f"Received request to process document: {payload.documents}")
     print(f"Number of questions: {len(payload.questions)}")
@@ -119,6 +163,30 @@ async def process_document(request: Request, payload: RequestPayload):
         f"Questions: {json.dumps(payload.questions)}"
     )
     
+    # FIRST: Check file extension before any processing
+    try:
+        file_extension = check_file_extension(payload.documents)
+        print(f"File extension validated: {file_extension}")
+    except UnsupportedDocumentError as e:
+        print(f"Unsupported document type detected before download: {e}")
+        
+        # Get the file extension to provide a more informative message
+        try:
+            file_extension = os.path.splitext(payload.documents.split('?')[0])[-1].lower()
+            if not file_extension:
+                file_extension = "unknown"
+        except Exception:
+            file_extension = "unknown"
+
+        # Craft the user-friendly response message
+        error_message = f"This is a {file_extension} file. The system is only built to handle .pdf, .docx, .xlsx, .pptx, .eml, and image files."
+
+        # Create a list of answers with the same message for every question asked
+        answers = [error_message] * len(payload.questions)
+
+        # Return a valid 200 OK response with the informative message
+        return ResponsePayload(answers=answers)
+    
     # Define request timeout - Extended from 90 to 120 seconds
     REQUEST_TIMEOUT = 120
     
@@ -127,17 +195,43 @@ async def process_document(request: Request, payload: RequestPayload):
         # This is crucial for maintaining FastAPI's asynchronous performance
         result = await asyncio.wait_for(
             run_in_threadpool(
-                rag_pipeline.run,
+                rag_pipeline._main_processing_loop,
                 document_url=payload.documents,
                 questions=payload.questions,
                 timeout=REQUEST_TIMEOUT
             ),
             timeout=REQUEST_TIMEOUT
         )
+    except UnsupportedDocumentError as e:
+        # This is a fallback in case the RAG pipeline also throws UnsupportedDocumentError
+        print(f"Unsupported document type received from RAG pipeline: {e}")
+        # Get the file extension to provide a more informative message
+        try:
+            file_extension = os.path.splitext(payload.documents.split('?')[0])[-1].lower()
+            if not file_extension:
+                file_extension = "unknown"
+        except Exception:
+            file_extension = "unknown"
+
+        # Craft the user-friendly response message
+        error_message = f"This is a {file_extension} file. The system is only built to handle .pdf, .docx, .xlsx, .pptx, .eml, and image files."
+
+        # Create a list of answers with the same message for every question asked
+        answers = [error_message] * len(payload.questions)
+
+        # Return a valid 200 OK response with the informative message
+        return ResponsePayload(answers=answers)
     except TimeoutError:
         return JSONResponse(
             status_code=504,
             content={"detail": "Request processing timed out after 120 seconds."}
+        )
+    except Exception as e:
+        # Handle any other exceptions that might occur
+        print(f"Unexpected error during processing: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"An unexpected error occurred: {str(e)}"}
         )
     
     # Check if the result contains an error
@@ -166,16 +260,24 @@ async def api_info():
     return {
         "api_name": "Multimodal RAG API",
         "version": "1.0.0",
-        "description": "Process PDF documents and answer questions using RAG with Gemini LLM",
+        "description": "Process various document types and answer questions using RAG with Gemini LLM",
         "endpoints": {
             "GET /": "Health check",
-            "POST /hackrx/run": "Process PDF and answer questions (requires Bearer token)",
+            "POST /hackrx/run": "Process documents and answer questions (requires Bearer token)",
             "GET /info": "API information"
         },
-        "supported_formats": ["PDF"],
+        "supported_formats": [
+            "PDF", "DOCX", "XLSX", "PPTX", "EML", 
+            "JPG", "JPEG", "PNG", "GIF", "BMP", "TIFF", "WEBP"
+        ],
+        "unsupported_formats": [
+            "ZIP", "RAR", "7Z", "TAR", "GZ", "BIN", "EXE", "DLL"
+        ],
         "features": [
             "Direct text extraction",
-            "OCR for scanned pages",
+            "OCR for scanned pages and images",
+            "Office document processing",
+            "Email parsing",
             "Semantic search with embeddings",
             "Question answering with Gemini Pro"
         ]
