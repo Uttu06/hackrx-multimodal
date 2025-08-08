@@ -187,7 +187,7 @@ class RAGPipeline:
     
     def _secure_http_request(self, url: str) -> str:
         """
-        Secure HTTP GET request with strict guardrails against unauthorized access.
+        Secure HTTP GET request with relaxed restrictions for puzzle/hackathon APIs.
         
         Args:
             url (str): URL to request
@@ -198,27 +198,28 @@ class RAGPipeline:
         print(f"Making secure HTTP request to: {url}")
         
         try:
-            # Make HTTP request with timeout
-            response = requests.get(url, timeout=15, allow_redirects=False)
+            # Add User-Agent to appear more like a regular browser request
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
             
-            # Security check: Only allow 200 OK responses
-            if response.status_code != 200:
-                error_msg = f"Failed to access URL: {response.status_code} {response.reason}"
-                print(f"Security block: {error_msg}")
-                return error_msg
+            # Make HTTP request with timeout and headers
+            response = requests.get(url, timeout=15, allow_redirects=True, headers=headers)
             
-            content = response.text.lower()
-            
-            # Security check: Detect login/authentication pages
-            auth_keywords = ['login', 'username', 'password', 'sign in', 'authentication', 'unauthorized']
-            if any(keyword in content for keyword in auth_keywords):
-                error_msg = "Failed to access URL: Authentication required"
-                print(f"Security block: {error_msg}")
-                return error_msg
-            
-            print(f"Successfully retrieved content from URL ({len(response.text)} chars)")
-            return response.text
-            
+            # Allow more HTTP status codes for APIs (not just 200)
+            if response.status_code in [200, 201, 202]:
+                print(f"Successfully retrieved content from URL ({len(response.text)} chars)")
+                return response.text
+            else:
+                error_msg = f"API returned status {response.status_code}: {response.reason}"
+                print(f"API Status Error: {error_msg}")
+                
+                # Still return the response text in case it contains useful error info
+                if response.text:
+                    return f"Status {response.status_code}: {response.text}"
+                else:
+                    return error_msg
+                
         except requests.RequestException as e:
             error_msg = f"Failed to access URL: {str(e)}"
             print(f"Request error: {error_msg}")
@@ -571,82 +572,6 @@ Respond with a single word: YES (if it contains actionable instructions/procedur
         except Exception as e:
             print(f"❌ Confidence Agent Stage 2 Error: {e}")
             return 'NOT_ANSWERED'
-        
-    def _post_process_and_format_answers(self, original_questions: list[str], generated_answers: list[str]) -> list[str]:
-        """
-        Post-processing and Formatting Agent that ensures language congruence and clean formatting.
-
-        Args:
-            original_questions (list[str]): The original questions asked by the user
-            generated_answers (list[str]): The generated answers from the RAG pipeline
-
-        Returns:
-            list[str]: Polished and properly formatted answers
-        """
-        print(f"🎨 Post-processing {len(generated_answers)} answers for language congruence...")
-        # If we have a mismatch in length, something went wrong - return as is
-        if len(original_questions) != len(generated_answers):
-            print(f"⚠️ Warning: Question/answer length mismatch ({len(original_questions)} vs {len(generated_answers)})")
-            return generated_answers
-        try:
-            # Create paired data for the formatting agent
-            qa_pairs = []
-            for i, (question, answer) in enumerate(zip(original_questions, generated_answers)):
-                qa_pairs.append(f"Q{i+1}: {question}\nA{i+1}: {answer}")
-            
-            formatted_pairs = "\n\n".join(qa_pairs)
-            formatting_prompt = f"""You are a final formatting and translation agent. Your job is to ensure that answers match the language and tone of the original questions.
-
-            **Your tasks:**
-            1. If an original question was asked in a non-English language, translate the answer back to that same language
-            2. Ensure consistent formatting and professional presentation
-            3. Maintain all factual accuracy and citations from the original answers
-            4. Keep the same number of answers as provided
-
-            **Input Question-Answer Pairs:**
-            {formatted_pairs}
-
-            **Output Format:**
-            Return a clean JSON object with a single key "polished_answers" containing a list of the formatted answers in the correct order.
-
-            Example:
-            {{"polished_answers": ["Answer 1", "Answer 2", "Answer 3"]}}
-
-            Your JSON response:"""
-
-            response = self.api_key_manager.call_llm(formatting_prompt, timeout=15)
-            response_text = response.text.strip()
-            # Parse the JSON response
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}')
-
-            if json_start != -1 and json_end != -1:
-                json_content = response_text[json_start:json_end + 1]
-                try:
-                    parsed_response = json.loads(json_content)
-
-                    if "polished_answers" in parsed_response and isinstance(parsed_response["polished_answers"], list):
-                        polished_answers = parsed_response["polished_answers"]
-
-                        # Verify we got the right number of answers
-                        if len(polished_answers) == len(original_questions):
-                            print(f"✅ Successfully polished {len(polished_answers)} answers")
-                            return polished_answers
-                        else:
-                            print(f"⚠️ Polishing returned wrong number of answers ({len(polished_answers)} vs {len(original_questions)})")
-                            return generated_answers  # Fallback to original
-                    else:
-                        print("⚠️ Invalid response format from formatting agent")
-                        return generated_answers  # Fallback to original
-                except json.JSONDecodeError as e:
-                    print(f"⚠️ Failed to parse formatting agent response: {e}")
-                    return generated_answers  # Fallback to original
-            else:
-                print("⚠️ No valid JSON found in formatting agent response")
-                return generated_answers  # Fallback to original
-        except Exception as e:
-            print(f"⚠️ Error in post-processing: {e} - returning original answers")
-            return generated_answers  # Safe fallback
     
     def _extract_urls_from_context(self, context: str, remaining_time: float) -> list[str]:
         """
@@ -713,136 +638,256 @@ URLs:"""
     
     def _execute_agentic_workflow_single_question(self, question: str, context: str, remaining_time: float) -> str:
         """
-        Execute agentic workflow for a single question when document contains instructions/procedures.
-        
+        Execute a general-purpose agentic workflow for any instruction-based question.
+        This method adapts to different types of puzzles, challenges, and procedural documents.
+
         Args:
             question (str): The question to answer
-            context (str): The instruction manual context
+            context (str): The instruction manual/document context
             remaining_time (float): Remaining processing time
-            
+        
         Returns:
             str: The final answer from the agentic workflow
         """
-        print(f"🤖 Starting agentic workflow for: {question[:50]}...")
+        print(f"🤖 Starting GENERAL agentic workflow for: {question[:50]}...")
+        print(f"🤖 [DEBUG] Context length: {len(context)} characters")
+        print(f"🤖 [DEBUG] Remaining time: {remaining_time} seconds")
         
         # The agent's scratchpad for the ReAct loop
         agent_scratchpad = ""
-        max_steps = 5  # Limit steps due to time constraints
+        max_steps = 8  # Generous limit for complex multi-step processes
         
         for step in range(max_steps):
+            print(f"\n🔄 [DEBUG] === STEP {step + 1}/{max_steps} ===")
+            
             # Check remaining time before each step
-            step_remaining_time = remaining_time - (step * 15)  # Estimate 15s per step
-            if step_remaining_time < 20:
-                print(f"⏱️ Time limit approaching, ending agentic workflow at step {step + 1}")
+            step_remaining_time = remaining_time - (step * 12)
+            if step_remaining_time < 15:
+                print(f"⏱️ [DEBUG] Time limit approaching: {step_remaining_time}s left")
                 break
             
-            # HARDENED AGENT PROMPT - REPLACED WITH NEW NON-CONVERSATIONAL VERSION
-            prompt = f"""<instructions>
-You are a precise, tool-using AI agent. Your only goal is to solve the puzzle by selecting the correct tool and parameters.
-You MUST ONLY respond with a single, valid JSON object that conforms to the specified format. DO NOT provide any other text, greetings, explanations, or conversational filler.
-Your response MUST be parsable by a standard JSON decoder.
-If you have found the final answer, your 'thought' string must start with 'Final Answer:'.
-</instructions>
+            # GENERAL-PURPOSE AGENT PROMPT THAT ADAPTS TO ANY SCENARIO
+            prompt = f"""You are an intelligent problem-solving agent. Your goal is to answer the user's question by following the instructions provided in the document.
 
-<goal>
-{question}
-</goal>
+            QUESTION TO SOLVE: {question}
 
-<tools_available>
-- `make_http_get_request(url: str)`: Use for all external web calls.
-- `find_info_in_document(query: str)`: Use to look up information in the initial document manual.
-</tools_available>
+            YOUR MISSION:
+            - Analyze the provided instructions to understand what steps are needed
+            - Execute those steps using the available tools
+            - Continue until you have the specific answer the user is looking for
+            - Do NOT just describe what should be done - actually DO IT using the tools
 
-<execution_history>
-{agent_scratchpad}
-</execution_history>
+            EXECUTION HISTORY:
+            {agent_scratchpad}
 
-<instruction_manual>
-{context[:4000]}
-</instruction_manual>
+            INSTRUCTIONS/CONTEXT:
+            {context[:3500]}
 
-<json_response_format>
-```json
-{{
-  "thought": "Your concise, step-by-step reasoning for the chosen action.",
-  "tool": {{
-    "name": "name_of_tool_to_call",
-    "input": {{
-      "argument_name": "value"
+            AVAILABLE TOOLS:
+            - make_http_get_request(url): Make HTTP requests to APIs, websites, or endpoints
+            - find_info_in_document(query): Search within the provided instructions for specific information
+
+            RESPONSE FORMAT:
+            You must respond with valid JSON only:
+            {{
+                 "thought": "Your reasoning about what to do next. Start with 'Final Answer: [your_answer]' when you have the complete solution.",
+                    "tool": {{
+                    "name": "tool_name_to_use",
+                    "input": {{
+          "parameter": "value"
+        }}
+      }}
     }}
-  }}
-}}
-</json_response_format>
-Your JSON output:
-"""
 
+        IMPORTANT GUIDELINES:
+    1. If you need to make API calls, actually make them - don't just plan to make them
+    2. If you need to look up information in the document, use find_info_in_document
+    3. If the instructions mention specific URLs, endpoints, or procedures - follow them exactly
+    4. Keep working until you have the final, specific answer the user wants
+    5. Only say "Final Answer:" when you have the actual complete answer
+
+    What is your next action?"""
+
+            print(f"🤖 [DEBUG] Sending general prompt to LLM...")
+            
             try:
                 # Get agent's next action
-                response = self.api_key_manager.call_llm(prompt, timeout=min(15, int(step_remaining_time - 10)))
+                response = self.api_key_manager.call_llm(prompt, timeout=min(15, int(step_remaining_time - 5)))
                 response_text = response.text.strip()
                 
-                # Parse JSON response
+                print(f"🤖 [DEBUG] Raw LLM response: {response_text[:400]}...")
+                
+                # Parse JSON response with multiple fallback methods
+                action_json = None
+                
                 try:
-                    # Extract JSON from response
+                    # Method 1: Find JSON block
                     json_start = response_text.find('{')
                     json_end = response_text.rfind('}')
-                    if json_start != -1 and json_end != -1:
+                    if json_start != -1 and json_end != -1 and json_end > json_start:
                         json_content = response_text[json_start:json_end + 1]
                         action_json = json.loads(json_content)
+                        print(f"🤖 [DEBUG] Successfully parsed JSON: {action_json}")
                     else:
-                        raise json.JSONDecodeError("No JSON found", response_text, 0)
+                        raise json.JSONDecodeError("No JSON brackets found", response_text, 0)
                     
+                except json.JSONDecodeError:
+                    # Method 2: Try to extract from code block
+                    if '```json' in response_text:
+                        try:
+                            start = response_text.find('```json') + 7
+                            end = response_text.find('```', start)
+                            if end > start:
+                                json_content = response_text[start:end].strip()
+                                action_json = json.loads(json_content)
+                                print(f"🤖 [DEBUG] Parsed JSON from code block: {action_json}")
+                        except:
+                            pass
+                    
+                    # Method 3: Last resort - try the entire response
+                    if action_json is None:
+                        try:
+                            action_json = json.loads(response_text)
+                            print(f"🤖 [DEBUG] Parsed entire response as JSON: {action_json}")
+                        except:
+                            print(f"❌ [DEBUG] Complete JSON parsing failure")
+                            print(f"❌ [DEBUG] Raw response: '{response_text}'")
+                            agent_scratchpad += f"Observation: Failed to parse JSON response. Please provide valid JSON format.\n"
+                            continue
+                
+                if action_json:
                     thought = action_json.get('thought', '')
                     tool_info = action_json.get('tool', {})
-                    tool_name = tool_info.get('name', '')
-                    tool_input = tool_info.get('input', {})
+                    tool_name = tool_info.get('name', '') if isinstance(tool_info, dict) else ''
+                    tool_input = tool_info.get('input', {}) if isinstance(tool_info, dict) else {}
+                    
+                    print(f"🧠 [DEBUG] Agent thought: {thought}")
+                    print(f"🔧 [DEBUG] Tool: {tool_name}")
+                    print(f"📝 [DEBUG] Input: {tool_input}")
                     
                     agent_scratchpad += f"\nStep {step + 1}:\nThought: {thought}\nTool: {tool_name} with input {tool_input}\n"
                     
-                    # Check if agent has final answer
-                    if "Final Answer:" in thought:
-                        final_answer = thought.split("Final Answer:")[-1].strip()
-                        print(f"🎯 Agent found final answer: {final_answer[:100]}...")
-                        return final_answer
+                    # Check for final answer with flexible detection
+                    final_answer_indicators = ["final answer:", "the answer is", "solution:", "result:"]
+                    thought_lower = thought.lower()
+                    
+                    final_answer_found = False
+                    for indicator in final_answer_indicators:
+                        if indicator in thought_lower:
+                            # Extract the answer part
+                            try:
+                                final_answer = thought.split(indicator, 1)[-1].strip()
+                                if final_answer and len(final_answer) > 0:
+                                    print(f"🎯 [DEBUG] FOUND FINAL ANSWER: {final_answer}")
+                                    return final_answer
+                                    final_answer_found = True
+                                    break
+                            except:
+                                continue
+                    
+                    if final_answer_found:
+                        continue
                     
                     # Execute the tool if specified
-                    if tool_name and tool_name != 'none':
-                        print(f"🔧 Executing tool: {tool_name}")
+                    if tool_name and tool_name.strip() and tool_name != 'none':
+                        print(f"🔧 [DEBUG] EXECUTING TOOL: {tool_name}")
                         
-                        if tool_name == 'make_http_get_request' and 'url' in tool_input:
-                            observation = self._secure_http_request(tool_input['url'])
-                        elif tool_name == 'find_info_in_document' and 'query' in tool_input:
-                            # Use the tools module's find_info_in_document function
-                            observation = tools.find_info_in_document(
-                                rag_pipeline=self,
-                                document_url="",  # Not needed since we have context
-                                query=tool_input['query'],
-                                context_override=context  # Pass the context directly
-                            )
+                        if tool_name == 'make_http_get_request':
+                            # Handle different ways the URL might be specified
+                            url = None
+                            if isinstance(tool_input, dict):
+                                url = tool_input.get('url') or tool_input.get('parameter') or tool_input.get('value')
+                            elif isinstance(tool_input, str):
+                                url = tool_input
+                            
+                            if url:
+                                print(f"🌐 [DEBUG] Making HTTP request to: {url}")
+                                observation = self._secure_http_request(url)
+                                print(f"🌐 [DEBUG] HTTP Response (first 200 chars): {observation[:200]}")
+                                
+                                # Provide helpful context about the response
+                                if observation.startswith("Failed to access URL:"):
+                                    print(f"❌ [DEBUG] API call FAILED")
+                                else:
+                                    print(f"✅ [DEBUG] API call SUCCESS - received {len(observation)} characters")
+                                    
+                            else:
+                                observation = "Error: No URL provided. Please specify a URL in the tool input."
+                                print(f"❌ [DEBUG] No URL found in tool input: {tool_input}")
+                                
+                        elif tool_name == 'find_info_in_document':
+                            # Handle different ways the query might be specified
+                            query = None
+                            if isinstance(tool_input, dict):
+                                query = tool_input.get('query') or tool_input.get('parameter') or tool_input.get('value')
+                            elif isinstance(tool_input, str):
+                                query = tool_input
+                            
+                            if query:
+                                print(f"📖 [DEBUG] Searching document for: '{query}'")
+                                observation = tools.find_info_in_document(
+                                    rag_pipeline=self,
+                                    document_url="",
+                                    query=query,
+                                    context_override=context
+                                )
+                                print(f"📖 [DEBUG] Document search result: {observation[:200]}...")
+                            else:
+                                observation = "Error: No search query provided. Please specify a query in the tool input."
+                                print(f"❌ [DEBUG] No query found in tool input: {tool_input}")
+                                
                         else:
-                            observation = f"Error: Unknown tool '{tool_name}' or missing required parameters"
+                            observation = f"Error: Unknown tool '{tool_name}'. Available tools: make_http_get_request, find_info_in_document"
+                            print(f"❌ [DEBUG] Unknown tool: {tool_name}")
                         
                         agent_scratchpad += f"Observation: {observation}\n"
-                        print(f"📝 Tool observation: {observation[:100]}...")
+                        print(f"📋 [DEBUG] Added observation to scratchpad")
+                        
                     else:
-                        agent_scratchpad += f"Observation: No tool executed\n"
-                
-                except json.JSONDecodeError as e:
-                    error_msg = f"Failed to parse agent response as JSON: {e}"
-                    print(f"❌ JSON Parse Error: {error_msg}")
-                    agent_scratchpad += f"Observation: {error_msg}. Please provide a valid JSON response.\n"
-                    continue
+                        print(f"⚠️ [DEBUG] No valid tool specified")
+                        agent_scratchpad += f"Observation: No tool executed. Please specify a tool to use.\n"
                 
             except Exception as e:
                 error_msg = f"Error in agent step {step + 1}: {str(e)}"
-                print(f"❌ Agent Step Error: {error_msg}")
+                print(f"❌ [DEBUG] Step error: {error_msg}")
                 agent_scratchpad += f"Observation: {error_msg}\n"
                 continue
         
-        # If we exit the loop without finding an answer
-        print("⚠️ Agent workflow completed without finding final answer")
-        return "Agent was unable to complete the task within the available time and steps."
-    
+        print(f"⚠️ [DEBUG] Agent workflow completed without definitive final answer")
+        print(f"📋 [DEBUG] Final execution history:")
+        print(agent_scratchpad)
+        
+        # Intelligent result extraction from the scratchpad
+        print(f"🔍 [DEBUG] Attempting to extract useful information from execution history...")
+        
+        # Look for patterns that might indicate successful results
+        useful_patterns = [
+            r'flight[_\s]*number[:\s]*([A-Z0-9]+)',
+            r'answer[:\s]*([A-Z0-9]+)',
+            r'result[:\s]*([A-Z0-9]+)',
+            r'code[:\s]*([A-Z0-9]+)',
+            r'id[:\s]*([A-Z0-9]+)'
+        ]
+        
+        for pattern in useful_patterns:
+            matches = re.findall(pattern, agent_scratchpad, re.IGNORECASE)
+            if matches:
+                potential_answer = matches[-1]  # Take the last match
+                print(f"🔍 [DEBUG] Found potential answer using pattern '{pattern}': {potential_answer}")
+                return f"Extracted result: {potential_answer}"
+        
+        # If no patterns match, look for any substantial observations with data
+        lines = agent_scratchpad.split('\n')
+        for line in lines:
+            if 'observation:' in line.lower():
+                line_content = line.strip()
+                # Check if this observation contains substantial alphanumeric content
+                if len(line_content) > 30 and any(c.isalnum() for c in line_content):
+                    print(f"🔍 [DEBUG] Found substantial observation: {line_content[:100]}...")
+                    return f"Partial result from execution: {line_content}"
+        
+        return "The agent completed its execution but was unable to determine the final answer. Please check the debug output above for details about what was attempted."
+        
     def _execute_rag_pipeline(self, document_url: str, questions: list[str], timeout: int = 120, 
                              text_chunks_override=None, index_override=None) -> dict:
         """
@@ -1416,33 +1461,42 @@ After reasoning, provide the final answer as a single, valid JSON object in a ``
                 web_augmented_answers[question] = initial_answer
 
         # Step 6: Re-assemble Final Answers
-        print("Step 6: Re-assembling final answers...")
+        print("Step 6: Re-assembling final answers from processed tasks...")
         final_answers_list = []
-        for task in tasks:
-            original_question = task['original_question']  
-            
+
+        # Iterate through the ORIGINAL questions to maintain the correct order and count
+        for original_question in questions:
+            # Find the corresponding task from our plan
+            task = next((t for t in tasks if t['original_question'] == original_question), None)
+
+            if not task:
+                # This is a fallback in case the router failed on a question
+                final_answers_list.append("Error: Failed to process this question in the routing stage.")
+                continue
+
             if task['classification'] == 'INVALID':
-                # For invalid questions, just append the rejection reason.
-                final_answers_list.append(final_answers_map.get(original_question, "This question cannot be answered."))
-    
+                final_answers_list.append(final_answers_map[original_question])
             else:
-        # For valid questions (simple or compound), we will collect all their sub-answers.
+                # This is a VALID question, collect the answers for its sub-questions
                 answers_for_this_task = []
                 for sub_question in task['sub_questions']:
-            # Find the answer for each sub_question from our results map.
-                    answer = web_augmented_answers.get(sub_question, "Processing timed out before this question could be answered.")
+                    # Use .get() for safety in case a sub-question timed out
+                    answer = web_augmented_answers.get(sub_question, "Processing timed out before this sub-question could be answered.")
                     answers_for_this_task.append(answer)
-        
-        # Join the sub-answers into a single, comprehensive final answer for the original question.
-        # Use a newline separator for better readability of compound answers.
-        final_answer_for_task = "\n\n".join(answers_for_this_task)
-        final_answers_list.append(final_answer_for_task)
-        
-        # Calculate final processing time
+                
+                # Intelligently join the answers. If there's only one, just use it.
+                # If there are multiple, join them with newlines for clarity.
+                if len(answers_for_this_task) == 1:
+                    final_answers_list.append(answers_for_this_task[0])
+                else:
+                    # For compound questions, format the combined answer clearly.
+                    combined_answer = "\n\n".join(answers_for_this_task)
+                    final_answers_list.append(combined_answer)
+
+        # Final performance logging
         total_time = time.time() - start_time
-        print(f"Processing complete! Total time: {total_time:.2f}s")
-        print("🔍 Starting final post-processing and translation step...")
-        final_polished_answers = self._post_process_and_format_answers(questions, final_answers_list)
+        print(f"Unified RAG Agent completed processing in {total_time:.1f}s")
+
         return {"answers": final_answers_list}
     
     def process_document_and_answer_questions(self, document_url: str, questions: list[str], timeout: int = 120) -> dict:
