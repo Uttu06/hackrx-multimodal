@@ -33,17 +33,27 @@ This is the recommended method. It guarantees that all system dependencies, like
 
 ### Steps
 
-**1. Build the Docker Image**
+1.  **Build the Docker Image**
 
-Open a terminal in the project's root directory and run the following command. This will download the base Python image, install Tesseract, set up all Python packages from `requirements.txt`, and package the application.
+    Open a terminal in the project's root directory and run the following command. This will download the base Python image, install Tesseract, set up all Python packages from `requirements.txt`, and package the application.
 
-docker build -t multimodal-rag-api .
-***2. Run the Docker Container***
-After the build is complete, run the container. You must provide your Gemini API keys as an environment variable using the -e flag. This is the secure way to handle secrets.
+    ```bash
+    docker build -t multimodal-rag-api .
+    ```
 
-docker run -p 8000:8000 -e GEMINI_API_KEYS="YOUR_API_KEY_1,YOUR_API_KEY_2" --name rag-api-container multimodal-rag-api
-***3. Check API Health***
-The API will now be running and accessible at http://localhost:8000. You can visit this URL in your browser or use curl to see the health check message:
+2.  **Run the Docker Container**
 
-curl http://localhost:8000/
-# Expected output: {"message":"Multimodal RAG API is running!"}
+    After the build is complete, run the container. You must provide your Gemini API keys as an environment variable using the `-e` flag. This is the secure way to handle secrets.
+
+    ```bash
+    docker run -p 8000:8000 -e GEMINI_API_KEYS="YOUR_API_KEY_1,YOUR_API_KEY_2" --name rag-api-container multimodal-rag-api
+    ```
+
+3.  **Check API Health**
+
+    The API will now be running and accessible at `http://localhost:8000`. You can visit this URL in your browser or use `curl` to see the health check message:
+
+    ```bash
+    curl http://localhost:8000/
+    # Expected output: {"message":"Multimodal RAG API is running!"}
+    ```
