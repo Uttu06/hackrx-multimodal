@@ -1,0 +1,21 @@
+# Git and Docker files
+.git/
+.gitignore
+Dockerfile
+.dockerignore
+
+# Virtual environment and cache
+venv/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+
+# Secrets and Logs (Very Important!)
+.env
+*.log
+api_requests.log
+
+# Operating System specific files
+.DS_Store
+Thumbs.db

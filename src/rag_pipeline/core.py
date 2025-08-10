@@ -432,8 +432,6 @@ Your response must be only the JSON object, no additional text."""
         
         # First, create a list of English-translated questions
         translated_questions = [self._translate_to_english(q) for q in questions]
-        # The rest of the router will now operate on these translated questions
-        original_to_translated_map = dict(zip(questions, translated_questions))
         
         prompt = f"""You are an expert query analysis agent. For the following list of user questions, analyze each one and classify it.
         Your tasks are:
@@ -453,41 +451,50 @@ Your response must be only the JSON object, no additional text."""
         ]
         """
         
+        # --- START: New, Bug-Free Router Logic ---
         try:
+            # Step 1: Translate and create a reverse mapping
+            original_questions = questions
+            translated_questions = [self._translate_to_english(q) for q in original_questions]
+            translated_to_original_map = dict(zip(translated_questions, original_questions))
+
+            # Step 2: Call the LLM with only the translated questions
             response = self.api_key_manager.call_llm(prompt, timeout=min(15, remaining_time//3))
             response_text = response.text.strip()
+            
+            # Step 3: Parse the response and remap to original questions
             json_start = response_text.find('[')
             json_end = response_text.rfind(']')
             if json_start != -1 and json_end != -1:
                 json_content = response_text[json_start:json_end + 1]
-                parsed_tasks = json.loads(json_content)
-                
-                # Map the results back to original questions
+                parsed_tasks_translated = json.loads(json_content)
+
                 final_tasks = []
-                for i, task in enumerate(parsed_tasks):
-                    if i < len(questions):
-                        # Replace the translated question with the original question
-                        original_question = questions[i]
-                        final_task = {
-                            "original_question": original_question,
-                            "classification": task.get("classification", "VALID_SIMPLE"),
-                            "sub_questions": task.get("sub_questions", [original_to_translated_map[original_question]]),
-                            "rejection_reason": task.get("rejection_reason", "")
+                for task_translated in parsed_tasks_translated:
+                    original_q_translated = task_translated.get("original_question")
+                    if original_q_translated in translated_to_original_map:
+                        # Create a new task dict with the ORIGINAL question
+                        task_original = {
+                            "original_question": translated_to_original_map[original_q_translated],
+                            "classification": task_translated.get("classification"),
+                            "sub_questions": task_translated.get("sub_questions"), # These are correctly in English
+                            "rejection_reason": task_translated.get("rejection_reason")
                         }
-                        final_tasks.append(final_task)
-                
+                        final_tasks.append(task_original)
                 return final_tasks
             else:
+                # Fallback logic if the LLM fails to return JSON
                 print("Warning: Router failed to return valid JSON. Processing questions as-is.")
-                return [{"original_question": q, "classification": "VALID_SIMPLE", "sub_questions": [original_to_translated_map[q]]} for q in questions]
+                return [{"original_question": q, "classification": "VALID_SIMPLE", "sub_questions": [t_q]} for q, t_q in zip(original_questions, translated_questions)]
+
         except Exception as e:
             print(f"Error in multilingual router, falling back to simple processing: {e}")
-            return [{"original_question": q, "classification": "VALID_SIMPLE", "sub_questions": [original_to_translated_map[q]]} for q in questions]
+            return [{"original_question": q, "classification": "VALID_SIMPLE", "sub_questions": [self._translate_to_english(q)]} for q in questions]
+        # --- END: New, Bug-Free Router Logic ---
     
-    def _validate_answer_completeness(self, question: str, context: str, generated_answer: str) -> str:
+    def _simple_validation_check(self, question: str, context: str, generated_answer: str) -> str:
         """
-        Two-Stage Confidence Agent - First checks completeness, then detects instruction manuals.
-        This is the meta-cognitive brain that recognizes when to switch from 'answerer' to 'doer'.
+        Simplified validation that only checks if the answer needs agentic workflow.
         
         Args:
             question (str): Original question
@@ -495,152 +502,37 @@ Your response must be only the JSON object, no additional text."""
             generated_answer (str): Generated answer to validate
             
         Returns:
-            str: 'COMPLETE', 'NOT_ANSWERED', 'NEEDS_WEB', or 'NEEDS_AGENT'
+            str: 'COMPLETE' or 'NEEDS_AGENT'
         """
-        print("🧠 Validating answer with Two-Stage Confidence Agent...")
+        print("🧠 Checking if agentic workflow is needed...")
 
-        # Stage 1: Standard completeness check with enhanced context awareness
-        completeness_prompt = f"""You are an intelligent document analyst. Analyze the information carefully.
-
-Question: '{question}'
-Source Context: '{context[:2500]}'
-Generated Answer: '{generated_answer}'
-
-**Analysis Framework:**
-1. Does the Generated Answer DIRECTLY and COMPLETELY answer the question using only the source context?
-2. Does the context explicitly mention URLs, API endpoints, or external resources needed to complete the answer?
-3. Does the context contain step-by-step instructions that require external actions?
-
-**Classification Rules:**
-- COMPLETE: Answer fully addresses question with context information
-- NEEDS_WEB: Context explicitly mentions URLs/endpoints/external resources for the final answer
-- NOT_ANSWERED: Context lacks the direct answer but may contain other types of information
-
-Respond with a single token: COMPLETE, NEEDS_WEB, or NOT_ANSWERED"""
-        
-        try:
-            response = self.api_key_manager.call_llm(completeness_prompt, timeout=12)
-            stage1_result = response.text.strip().upper()
-            
-            if 'NEEDS_WEB' in stage1_result:
-                print("✅ Stage 1: Answer requires web tools - activating web augmentation")
-                return 'NEEDS_WEB'
-                
-            if 'COMPLETE' in stage1_result:
-                print("✅ Stage 1: Answer is complete and sufficient")
-                return 'COMPLETE'
-                
-            # If we reach here, it's NOT_ANSWERED - proceed to Stage 2
-            print("⚠️ Stage 1: Direct answer not found - proceeding to Stage 2: Instruction Detection...")
-            
-        except Exception as e:
-            print(f"❌ Confidence Agent Stage 1 Error: {e} - proceeding to Stage 2...")
-
-        # Stage 2: Meta-cognitive instruction detection - the critical upgrade
-        instruction_prompt = f"""You are a meta-cognitive agent that recognizes different types of documents. 
-
-**Context:** The user asked: '{question}'
-**Situation:** The document does NOT contain a direct answer to this question.
-**Critical Question:** Does this document instead contain instructions, steps, a puzzle, or a procedural guide that would allow someone to FIND or COMPUTE the answer?
-
-**Document Analysis Checklist:**
-□ Does it contain numbered steps or a sequence of actions?
-□ Does it mention APIs, endpoints, or external tools to use?
-□ Does it describe a puzzle, game, or challenge to solve?
-□ Does it provide lookup tables, mappings, or reference data?
-□ Does it give instructions like "call this endpoint", "follow these steps", "decode using this method"?
-□ Does it describe a workflow or process to achieve a goal?
-
-**Document Text:** 
-{context[:4500]}
-
-**Meta-Recognition:** Is this document an INSTRUCTION MANUAL or PROCEDURAL GUIDE rather than a direct information source?
-
-Respond with a single word: YES (if it contains actionable instructions/procedures) or NO (if it's just informational without procedures)"""
-        
-        try:
-            response = self.api_key_manager.call_llm(instruction_prompt, timeout=15)
-            stage2_result = response.text.strip().upper()
-            
-            if "YES" in stage2_result:
-                print("🚀 Stage 2: Document contains actionable instructions - ACTIVATING AGENT MODE")
-                return 'NEEDS_AGENT'  # New status to trigger agentic workflow
-            else:
-                print("📄 Stage 2: Document is informational only - no actionable instructions found")
-                return 'NOT_ANSWERED'
-                
-        except Exception as e:
-            print(f"❌ Confidence Agent Stage 2 Error: {e}")
-            return 'NOT_ANSWERED'
-    
-    def _extract_urls_from_context(self, context: str, remaining_time: float) -> list[str]:
-        """
-        Extract specific URLs mentioned in the context for web augmentation.
-        
-        Args:
-            context (str): Context containing URL references
-            remaining_time (float): Remaining processing time
-            
-        Returns:
-            list[str]: List of URLs to visit
-        """
-        print("Extracting URLs from context for web augmentation...")
-        
-        # First, try regex pattern matching for common URLs
-        url_patterns = [
-            r'https?://[^\s<>"\']+',
-            r'www\.[^\s<>"\']+',
+        # Check if context contains instructions, steps, or procedural guides
+        instruction_indicators = [
+            'step', 'call', 'endpoint', 'api', 'url', 'procedure', 'instruction',
+            'follow', 'execute', 'process', 'workflow', 'puzzle', 'challenge'
         ]
         
-        found_urls = []
-        for pattern in url_patterns:
-            matches = re.findall(pattern, context, re.IGNORECASE)
-            found_urls.extend(matches)
+        context_lower = context.lower()
+        has_instructions = any(indicator in context_lower for indicator in instruction_indicators)
         
-        if found_urls:
-            print(f"Found {len(found_urls)} URLs using regex patterns")
-            # Clean and deduplicate URLs
-            cleaned_urls = []
-            for url in found_urls:
-                url = url.strip('.,;:!?')  # Remove trailing punctuation
-                if url not in cleaned_urls:
-                    cleaned_urls.append(url)
-            return cleaned_urls[:3]  # Limit to 3 URLs for safety
+        # Also check if the generated answer indicates missing information
+        answer_lower = generated_answer.lower()
+        is_incomplete = any(phrase in answer_lower for phrase in [
+            'not found', 'cannot be answered', 'insufficient information', 
+            'not available', 'unable to determine'
+        ])
         
-        # If no URLs found with regex, use LLM to extract them
-        if remaining_time > 10:
-            extraction_prompt = f"""Extract any URLs mentioned in the following context. Return only the URLs, one per line, with no additional text.
-
-Context: {context[:1500]}
-
-URLs:"""
-            
-            try:
-                response = self.api_key_manager.call_llm(extraction_prompt, timeout=10)
-                response_text = response.text.strip()
-                
-                # Parse URLs from response
-                urls = []
-                for line in response_text.split('\n'):
-                    line = line.strip()
-                    if line and ('http' in line or 'www' in line):
-                        urls.append(line)
-                
-                if urls:
-                    print(f"Extracted {len(urls)} URLs using LLM")
-                    return urls[:3]  # Limit to 3 URLs
-                    
-            except Exception as e:
-                print(f"Error extracting URLs with LLM: {e}")
-        
-        print("No URLs found in context")
-        return []
+        if has_instructions and is_incomplete:
+            print("🚀 Context contains instructions and answer is incomplete - ACTIVATING AGENT MODE")
+            return 'NEEDS_AGENT'
+        else:
+            print("📄 Standard RAG answer is sufficient")
+            return 'COMPLETE'
     
     def _execute_agentic_workflow_single_question(self, question: str, context: str, remaining_time: float) -> str:
         """
-        Execute a general-purpose agentic workflow for any instruction-based question.
-        This method adapts to different types of puzzles, challenges, and procedural documents.
-
+        Solves a multi-step puzzle using a Plan-and-Execute agentic workflow.
+        
         Args:
             question (str): The question to answer
             context (str): The instruction manual/document context
@@ -649,244 +541,112 @@ URLs:"""
         Returns:
             str: The final answer from the agentic workflow
         """
-        print(f"🤖 Starting GENERAL agentic workflow for: {question[:50]}...")
-        print(f"🤖 [DEBUG] Context length: {len(context)} characters")
-        print(f"🤖 [DEBUG] Remaining time: {remaining_time} seconds")
-        
-        # The agent's scratchpad for the ReAct loop
-        agent_scratchpad = ""
-        max_steps = 8  # Generous limit for complex multi-step processes
-        
-        for step in range(max_steps):
-            print(f"\n🔄 [DEBUG] === STEP {step + 1}/{max_steps} ===")
-            
-            # Check remaining time before each step
-            step_remaining_time = remaining_time - (step * 12)
-            if step_remaining_time < 15:
-                print(f"⏱️ [DEBUG] Time limit approaching: {step_remaining_time}s left")
-                break
-            
-            # GENERAL-PURPOSE AGENT PROMPT THAT ADAPTS TO ANY SCENARIO
-            prompt = f"""You are an intelligent problem-solving agent. Your goal is to answer the user's question by following the instructions provided in the document.
+        print("🤖 Starting Plan-and-Execute Agent...")
 
-            QUESTION TO SOLVE: {question}
+        # Stage 1: The "Planner" - Generate a complete JSON plan of tool calls.
+        planning_prompt = f"""You are a world-class AI planning agent. Your only task is to analyze the user's GOAL and the provided INSTRUCTION MANUAL and generate a complete, step-by-step plan of tool calls to achieve the goal.
 
-            YOUR MISSION:
-            - Analyze the provided instructions to understand what steps are needed
-            - Execute those steps using the available tools
-            - Continue until you have the specific answer the user is looking for
-            - Do NOT just describe what should be done - actually DO IT using the tools
+**GOAL:**
+"{question}"
 
-            EXECUTION HISTORY:
-            {agent_scratchpad}
+**TOOLS AVAILABLE:**
+1. `make_http_get_request(url: str)`
+2. `find_info_in_document(query: str)`
 
-            INSTRUCTIONS/CONTEXT:
-            {context[:3500]}
+**INSTRUCTION MANUAL (For Reference):**
+{context[:6000]}
 
-            AVAILABLE TOOLS:
-            - make_http_get_request(url): Make HTTP requests to APIs, websites, or endpoints
-            - find_info_in_document(query): Search within the provided instructions for specific information
+**--- YOUR TASK ---**
+You must generate a complete JSON list of every tool call required to solve the puzzle. The input for a step can use the output of a previous step by using the placeholder "{{step_X_result}}".
 
-            RESPONSE FORMAT:
-            You must respond with valid JSON only:
-            {{
-                 "thought": "Your reasoning about what to do next. Start with 'Final Answer: [your_answer]' when you have the complete solution.",
-                    "tool": {{
-                    "name": "tool_name_to_use",
-                    "input": {{
-          "parameter": "value"
-        }}
-      }}
-    }}
+**JSON-ONLY RESPONSE FORMAT:**
+```json
+[
+  {{ "step": 1, "tool_name": "make_http_get_request", "tool_input": {{ "url": "https://..." }} }},
+  {{ "step": 2, "tool_name": "find_info_in_document", "tool_input": {{ "query": "Landmark for {{step_1_result}}" }} }},
+  {{ "step": 3, "tool_name": "make_http_get_request", "tool_input": {{ "url": "https://.../{{step_2_result}}" }} }}
+]
+```
+Your JSON Plan:
+"""
 
-        IMPORTANT GUIDELINES:
-    1. If you need to make API calls, actually make them - don't just plan to make them
-    2. If you need to look up information in the document, use find_info_in_document
-    3. If the instructions mention specific URLs, endpoints, or procedures - follow them exactly
-    4. Keep working until you have the final, specific answer the user wants
-    5. Only say "Final Answer:" when you have the actual complete answer
+        try:
+            print("Generating a multi-step execution plan...")
+            response = self.api_key_manager.call_llm(planning_prompt, timeout=20)
+            response_text = response.text.strip()
+            json_start = response_text.find('[')
+            json_end = response_text.rfind(']')
+            plan = json.loads(response_text[json_start:json_end + 1])
+            print(f"✅ Plan generated with {len(plan)} steps.")
+        except Exception as e:
+            print(f"❌ Agent failed to create a valid plan: {e}")
+            return "Agent could not devise a plan to solve the puzzle."
 
-    What is your next action?"""
+        # Stage 2: The "Executor" - A simple loop to execute the plan.
+        execution_context = {"manual": context}
+        final_result = "Plan executed, but no final answer was found."
 
-            print(f"🤖 [DEBUG] Sending general prompt to LLM...")
-            
+        for i, step in enumerate(plan):
+            print(f"Executing step {i+1}: Calling tool '{step['tool_name']}'...")
+            tool_name = step['tool_name']
+            tool_input = step['tool_input']
+            tool_function = self.tools.get(tool_name)
+
+            # ** DYNAMIC INPUT MAPPING ** - This is the key to multi-step logic
+            for key, value in tool_input.items():
+                if isinstance(value, str) and "{{" in value and "}}" in value:
+                    placeholder_match = re.search(r'\{\{(.*?)\}\}', value)
+                    if placeholder_match:
+                        placeholder = placeholder_match.group(1)
+                        if placeholder in execution_context:
+                            tool_input[key] = value.replace(f"{{{{{placeholder}}}}}", str(execution_context[placeholder]))
+
             try:
-                # Get agent's next action
-                response = self.api_key_manager.call_llm(prompt, timeout=min(15, int(step_remaining_time - 5)))
-                response_text = response.text.strip()
+                if tool_name == "make_http_get_request":
+                    result = tool_function(tool_input.get('url', ''))
+                elif tool_name == "find_info_in_document":
+                    result = tool_function(
+                        rag_pipeline=self,
+                        document_url="",
+                        query=tool_input.get('query', ''),
+                        context_override=context
+                    )
+                else:
+                    result = f"Unknown tool: {tool_name}"
                 
-                print(f"🤖 [DEBUG] Raw LLM response: {response_text[:400]}...")
-                
-                # Parse JSON response with multiple fallback methods
-                action_json = None
-                
-                try:
-                    # Method 1: Find JSON block
-                    json_start = response_text.find('{')
-                    json_end = response_text.rfind('}')
-                    if json_start != -1 and json_end != -1 and json_end > json_start:
-                        json_content = response_text[json_start:json_end + 1]
-                        action_json = json.loads(json_content)
-                        print(f"🤖 [DEBUG] Successfully parsed JSON: {action_json}")
-                    else:
-                        raise json.JSONDecodeError("No JSON brackets found", response_text, 0)
-                    
-                except json.JSONDecodeError:
-                    # Method 2: Try to extract from code block
-                    if '```json' in response_text:
-                        try:
-                            start = response_text.find('```json') + 7
-                            end = response_text.find('```', start)
-                            if end > start:
-                                json_content = response_text[start:end].strip()
-                                action_json = json.loads(json_content)
-                                print(f"🤖 [DEBUG] Parsed JSON from code block: {action_json}")
-                        except:
-                            pass
-                    
-                    # Method 3: Last resort - try the entire response
-                    if action_json is None:
-                        try:
-                            action_json = json.loads(response_text)
-                            print(f"🤖 [DEBUG] Parsed entire response as JSON: {action_json}")
-                        except:
-                            print(f"❌ [DEBUG] Complete JSON parsing failure")
-                            print(f"❌ [DEBUG] Raw response: '{response_text}'")
-                            agent_scratchpad += f"Observation: Failed to parse JSON response. Please provide valid JSON format.\n"
-                            continue
-                
-                if action_json:
-                    thought = action_json.get('thought', '')
-                    tool_info = action_json.get('tool', {})
-                    tool_name = tool_info.get('name', '') if isinstance(tool_info, dict) else ''
-                    tool_input = tool_info.get('input', {}) if isinstance(tool_info, dict) else {}
-                    
-                    print(f"🧠 [DEBUG] Agent thought: {thought}")
-                    print(f"🔧 [DEBUG] Tool: {tool_name}")
-                    print(f"📝 [DEBUG] Input: {tool_input}")
-                    
-                    agent_scratchpad += f"\nStep {step + 1}:\nThought: {thought}\nTool: {tool_name} with input {tool_input}\n"
-                    
-                    # Check for final answer with flexible detection
-                    final_answer_indicators = ["final answer:", "the answer is", "solution:", "result:"]
-                    thought_lower = thought.lower()
-                    
-                    final_answer_found = False
-                    for indicator in final_answer_indicators:
-                        if indicator in thought_lower:
-                            # Extract the answer part
-                            try:
-                                final_answer = thought.split(indicator, 1)[-1].strip()
-                                if final_answer and len(final_answer) > 0:
-                                    print(f"🎯 [DEBUG] FOUND FINAL ANSWER: {final_answer}")
-                                    return final_answer
-                                    final_answer_found = True
-                                    break
-                            except:
-                                continue
-                    
-                    if final_answer_found:
-                        continue
-                    
-                    # Execute the tool if specified
-                    if tool_name and tool_name.strip() and tool_name != 'none':
-                        print(f"🔧 [DEBUG] EXECUTING TOOL: {tool_name}")
-                        
-                        if tool_name == 'make_http_get_request':
-                            # Handle different ways the URL might be specified
-                            url = None
-                            if isinstance(tool_input, dict):
-                                url = tool_input.get('url') or tool_input.get('parameter') or tool_input.get('value')
-                            elif isinstance(tool_input, str):
-                                url = tool_input
-                            
-                            if url:
-                                print(f"🌐 [DEBUG] Making HTTP request to: {url}")
-                                observation = self._secure_http_request(url)
-                                print(f"🌐 [DEBUG] HTTP Response (first 200 chars): {observation[:200]}")
-                                
-                                # Provide helpful context about the response
-                                if observation.startswith("Failed to access URL:"):
-                                    print(f"❌ [DEBUG] API call FAILED")
-                                else:
-                                    print(f"✅ [DEBUG] API call SUCCESS - received {len(observation)} characters")
-                                    
-                            else:
-                                observation = "Error: No URL provided. Please specify a URL in the tool input."
-                                print(f"❌ [DEBUG] No URL found in tool input: {tool_input}")
-                                
-                        elif tool_name == 'find_info_in_document':
-                            # Handle different ways the query might be specified
-                            query = None
-                            if isinstance(tool_input, dict):
-                                query = tool_input.get('query') or tool_input.get('parameter') or tool_input.get('value')
-                            elif isinstance(tool_input, str):
-                                query = tool_input
-                            
-                            if query:
-                                print(f"📖 [DEBUG] Searching document for: '{query}'")
-                                observation = tools.find_info_in_document(
-                                    rag_pipeline=self,
-                                    document_url="",
-                                    query=query,
-                                    context_override=context
-                                )
-                                print(f"📖 [DEBUG] Document search result: {observation[:200]}...")
-                            else:
-                                observation = "Error: No search query provided. Please specify a query in the tool input."
-                                print(f"❌ [DEBUG] No query found in tool input: {tool_input}")
-                                
-                        else:
-                            observation = f"Error: Unknown tool '{tool_name}'. Available tools: make_http_get_request, find_info_in_document"
-                            print(f"❌ [DEBUG] Unknown tool: {tool_name}")
-                        
-                        agent_scratchpad += f"Observation: {observation}\n"
-                        print(f"📋 [DEBUG] Added observation to scratchpad")
-                        
-                    else:
-                        print(f"⚠️ [DEBUG] No valid tool specified")
-                        agent_scratchpad += f"Observation: No tool executed. Please specify a tool to use.\n"
-                
+                execution_context[f"step_{i+1}_result"] = result
+                final_result = result
+                print(f"Step {i+1} result: {str(result)[:100]}...")
             except Exception as e:
-                error_msg = f"Error in agent step {step + 1}: {str(e)}"
-                print(f"❌ [DEBUG] Step error: {error_msg}")
-                agent_scratchpad += f"Observation: {error_msg}\n"
-                continue
-        
-        print(f"⚠️ [DEBUG] Agent workflow completed without definitive final answer")
-        print(f"📋 [DEBUG] Final execution history:")
-        print(agent_scratchpad)
-        
-        # Intelligent result extraction from the scratchpad
-        print(f"🔍 [DEBUG] Attempting to extract useful information from execution history...")
-        
-        # Look for patterns that might indicate successful results
-        useful_patterns = [
-            r'flight[_\s]*number[:\s]*([A-Z0-9]+)',
-            r'answer[:\s]*([A-Z0-9]+)',
-            r'result[:\s]*([A-Z0-9]+)',
-            r'code[:\s]*([A-Z0-9]+)',
-            r'id[:\s]*([A-Z0-9]+)'
-        ]
-        
-        for pattern in useful_patterns:
-            matches = re.findall(pattern, agent_scratchpad, re.IGNORECASE)
-            if matches:
-                potential_answer = matches[-1]  # Take the last match
-                print(f"🔍 [DEBUG] Found potential answer using pattern '{pattern}': {potential_answer}")
-                return f"Extracted result: {potential_answer}"
-        
-        # If no patterns match, look for any substantial observations with data
-        lines = agent_scratchpad.split('\n')
-        for line in lines:
-            if 'observation:' in line.lower():
-                line_content = line.strip()
-                # Check if this observation contains substantial alphanumeric content
-                if len(line_content) > 30 and any(c.isalnum() for c in line_content):
-                    print(f"🔍 [DEBUG] Found substantial observation: {line_content[:100]}...")
-                    return f"Partial result from execution: {line_content}"
-        
-        return "The agent completed its execution but was unable to determine the final answer. Please check the debug output above for details about what was attempted."
+                return f"Error during execution of step {i+1}: {str(e)}"
+
+        # Get the final answer from the execution context
+        final_answer = execution_context.get(f"step_{len(plan)}_result", final_result)
+
+        # --- START: Final Answer Parsing Logic ---
+
+        print(f"🧠 Raw final answer is: {final_answer}. Parsing for the specific detail...")
+
+        parsing_prompt = f"""You are an expert data extraction bot.
+The user's original question was: '{question}'
+The final raw data retrieved by the agent is:
+'{final_answer}'
+
+Your task is to extract the single, specific piece of information that directly answers the user's question.
+Respond with ONLY that piece of data and nothing else.
+"""
+
+        try:
+            # Use a fresh, final API call to parse the result.
+            final_response = self.api_key_manager.call_llm(parsing_prompt)
+            cleaned_final_answer = final_response.text.strip()
+            print(f"✅ Parsed final answer: {cleaned_final_answer}")
+            return cleaned_final_answer
+        except Exception as e:
+            print(f"❌ Failed to parse the final answer, returning raw output. Error: {e}")
+            return final_answer  # Fallback to raw output on error
+
+        # --- END: Final Answer Parsing Logic ---
         
     def _execute_rag_pipeline(self, document_url: str, questions: list[str], timeout: int = 120, 
                              text_chunks_override=None, index_override=None) -> dict:
@@ -1137,7 +897,7 @@ If the retrieved context contains an explicit instruction on how to answer a que
     
     def _main_processing_loop(self, document_url: str, questions: list[str], timeout: int) -> dict:
         """
-        Main unified processing loop with intelligent web augmentation.
+        Main unified processing loop with simplified agentic workflow integration.
         
         Args:
             document_url (str): URL of the document to process
@@ -1262,7 +1022,7 @@ If the retrieved context contains an explicit instruction on how to answer a que
         while i < len(questions_to_process):
             # Check for timeout before each batch
             remaining_time = timeout - (time.time() - start_time)
-            if remaining_time < 30:  # Need at least 30 seconds for validation and potential web augmentation
+            if remaining_time < 30:  # Need at least 30 seconds for validation and potential agent workflow
                 print("Time limit approaching, ending initial RAG processing.")
                 break
 
@@ -1306,159 +1066,54 @@ If the retrieved context contains an explicit instruction on how to answer a que
             i += len(question_batch)
             batch_number += 1
 
-        # Step 5: Validation and Web Augmentation (25% of timeout)
-        print("Step 5: Validating answers and performing web augmentation where needed...")
+        # Step 5: Validation and Agentic Workflow (25% of timeout)
+        print("Step 5: Validating answers and activating agentic workflow where needed...")
         
         remaining_time = timeout - (time.time() - start_time)
-        web_augmented_answers = {}
+        final_sub_answers = {}
         
         for question, initial_answer in sub_question_answers.items():
             # Check remaining time
             remaining_time = timeout - (time.time() - start_time)
             if remaining_time < 15:
                 print(f"Time limit reached, keeping initial answer for: {question[:50]}...")
-                web_augmented_answers[question] = initial_answer
+                final_sub_answers[question] = initial_answer
                 continue
             
             # Skip validation if initial answer is an error
             if initial_answer.startswith("Error:"):
-                web_augmented_answers[question] = initial_answer
+                final_sub_answers[question] = initial_answer
                 continue
                 
             try:
-                # Validate answer completeness with enhanced two-stage logic
+                # Simplified validation check
                 context = sub_question_contexts.get(question, "")
-                validation_result = self._validate_answer_completeness(question, context, initial_answer)
+                validation_result = self._simple_validation_check(question, context, initial_answer)
                 
-                # Handle all validation results: COMPLETE, NOT_ANSWERED, NEEDS_WEB, and NEEDS_AGENT
-                if validation_result in ['NEEDS_WEB', 'NEEDS_AGENT']:
-                    print(f"🤖 Answer requires {'web augmentation' if validation_result == 'NEEDS_WEB' else 'agentic workflow'} for: {question[:50]}...")
+                if validation_result == 'NEEDS_AGENT':
+                    print(f"🤖 Activating agentic workflow for: {question[:50]}...")
                     
-                    if validation_result == 'NEEDS_WEB':
-                        # Traditional web augmentation path
-                        urls_to_visit = self._extract_urls_from_context(context, remaining_time)
-                        
-                        if urls_to_visit:
-                            print(f"🌐 Starting web augmentation to visit {len(urls_to_visit)} URLs...")
-                            
-                            web_content = []
-                            max_urls = min(2, len(urls_to_visit))  # Limit to 2 URLs for time management
-                            
-                            for url in urls_to_visit[:max_urls]:
-                                # Check time before each request
-                                remaining_time = timeout - (time.time() - start_time)
-                                if remaining_time < 10:
-                                    print("Time limit approaching, stopping web requests")
-                                    break
-                                    
-                                print(f"Visiting URL: {url}")
-                                content = self._secure_http_request(url)
-                                
-                                if not content.startswith("Failed to access URL:"):
-                                    # Successful retrieval, add to web content
-                                    web_content.append(f"--- WEB CONTENT FROM {url} ---\n{content[:2000]}\n--- END WEB CONTENT ---")
-                                else:
-                                    # Failed retrieval, add error message
-                                    web_content.append(f"--- WEB ERROR FROM {url} ---\n{content}\n--- END WEB ERROR ---")
-                            
-                            if web_content:
-                                # Augment context with web content
-                                augmented_context = context + "\n\n" + "\n\n".join(web_content)
-                                
-                                # Re-run Chain-of-Thought with augmented context
-                                augmentation_prompt = f"""You are a highly intelligent document analysis agent. Answer the question using both the original document context AND the new web content provided.
-
-**Reasoning Process:**
-1. First, analyze the user's question and identify the key information needed.
-2. Second, scan both the original document context and the web content to find relevant information.
-3. Third, synthesize information from all sources to provide a comprehensive answer.
-4. Fourth, cite your sources appropriately for both document and web content.
-5. Enclose your entire step-by-step reasoning in <reasoning> tags.
-
-**Output Format:**
-After reasoning, provide the final answer as a single, valid JSON object in a ```json block. The JSON must contain a single key, "answer", which is a string. Cite document sources like `[Page 1]` and web sources like `[Web: {url}]`.
-
-**AUGMENTED CONTEXT:**
----
-{augmented_context[:4000]}  # Limit context size
----
-
-**QUESTION:**
----
-{question}
----"""
-                                
-                                try:
-                                    remaining_time = timeout - (time.time() - start_time)
-                                    if remaining_time > 10:
-                                        print(f"Re-generating answer with web-augmented context...")
-                                        
-                                        response = self.api_key_manager.call_llm(augmentation_prompt, timeout=min(15, int(remaining_time - 5)))
-                                        response_text = response.text
-                                        
-                                        # Parse augmented response
-                                        json_start = response_text.find('```json')
-                                        json_end = response_text.find('```', json_start + 7)
-                                        
-                                        if json_start != -1 and json_end != -1:
-                                            json_content = response_text[json_start + 7:json_end].strip()
-                                        else:
-                                            start_idx = response_text.find('{')
-                                            end_idx = response_text.rfind('}')
-                                            if start_idx != -1 and end_idx != -1:
-                                                json_content = response_text[start_idx:end_idx + 1]
-                                            else:
-                                                json_content = response_text
-                                        
-                                        try:
-                                            parsed_augmented = json.loads(json_content)
-                                            if "answer" in parsed_augmented:
-                                                web_augmented_answers[question] = parsed_augmented["answer"]
-                                                print(f"Successfully generated web-augmented answer for: {question[:50]}...")
-                                            else:
-                                                web_augmented_answers[question] = initial_answer  # Fallback
-                                        except json.JSONDecodeError:
-                                            print("Error parsing augmented response, using initial answer")
-                                            web_augmented_answers[question] = initial_answer
-                                    else:
-                                        print("Not enough time for augmentation, using initial answer")
-                                        web_augmented_answers[question] = initial_answer
-                                        
-                                except Exception as e:
-                                    print(f"Error in web augmentation: {e}, using initial answer")
-                                    web_augmented_answers[question] = initial_answer
-                            else:
-                                print("No successful web content retrieved, using initial answer")
-                                web_augmented_answers[question] = initial_answer
-                        else:
-                            print("No URLs found in context, using initial answer")
-                            web_augmented_answers[question] = initial_answer
-                    
-                    elif validation_result == 'NEEDS_AGENT':
-                        # NEW: Agentic workflow path for instruction manuals/puzzles
-                        print(f"🎯 Activating agentic workflow for instruction manual/puzzle...")
-                        
-                        remaining_time = timeout - (time.time() - start_time)
-                        if remaining_time > 20:
-                            try:
-                                # Execute agentic workflow for this single question
-                                agent_result = self._execute_agentic_workflow_single_question(question, context, remaining_time)
-                                web_augmented_answers[question] = agent_result
-                                print(f"✅ Successfully completed agentic workflow for: {question[:50]}...")
-                            except Exception as e:
-                                print(f"❌ Error in agentic workflow: {e}, using initial answer")
-                                web_augmented_answers[question] = initial_answer
-                        else:
-                            print("⏱️ Not enough time for agentic workflow, using initial answer")
-                            web_augmented_answers[question] = initial_answer
+                    remaining_time = timeout - (time.time() - start_time)
+                    if remaining_time > 20:
+                        try:
+                            # Execute agentic workflow for this single question
+                            agent_result = self._execute_agentic_workflow_single_question(question, context, remaining_time)
+                            final_sub_answers[question] = agent_result
+                            print(f"✅ Successfully completed agentic workflow for: {question[:50]}...")
+                        except Exception as e:
+                            print(f"❌ Error in agentic workflow: {e}, using initial answer")
+                            final_sub_answers[question] = initial_answer
+                    else:
+                        print("⏱️ Not enough time for agentic workflow, using initial answer")
+                        final_sub_answers[question] = initial_answer
                 else:
-                    # Answer is complete or not answerable, use initial answer
-                    print(f"Answer validation result '{validation_result}' for: {question[:50]}...")
-                    web_augmented_answers[question] = initial_answer
+                    # Answer is complete, use initial answer
+                    print(f"Answer is complete for: {question[:50]}...")
+                    final_sub_answers[question] = initial_answer
                     
             except Exception as e:
-                print(f"Error in validation/augmentation for question: {e}")
-                web_augmented_answers[question] = initial_answer
+                print(f"Error in validation for question: {e}")
+                final_sub_answers[question] = initial_answer
 
         # Step 6: Re-assemble Final Answers
         print("Step 6: Re-assembling final answers from processed tasks...")
@@ -1481,7 +1136,7 @@ After reasoning, provide the final answer as a single, valid JSON object in a ``
                 answers_for_this_task = []
                 for sub_question in task['sub_questions']:
                     # Use .get() for safety in case a sub-question timed out
-                    answer = web_augmented_answers.get(sub_question, "Processing timed out before this sub-question could be answered.")
+                    answer = final_sub_answers.get(sub_question, "Processing timed out before this sub-question could be answered.")
                     answers_for_this_task.append(answer)
                 
                 # Intelligently join the answers. If there's only one, just use it.
